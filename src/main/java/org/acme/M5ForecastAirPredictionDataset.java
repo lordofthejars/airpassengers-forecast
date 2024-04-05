@@ -80,7 +80,7 @@ public class M5ForecastAirPredictionDataset extends TimeSeriesDataset {
         }
     }
 
-    private static final class AirPassengers {
+    public static final class AirPassengers {
         Date start;
         float[] target;
     }

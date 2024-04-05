@@ -1,5 +1,9 @@
 package org.acme;
 
+import ai.djl.timeseries.timefeature.TimeFeature;
+import ai.djl.timeseries.translator.DeepARTranslator;
+import ai.djl.training.dataset.Batch;
+import ai.djl.util.Progress;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
@@ -10,7 +14,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Instant;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.LocalTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -60,6 +67,8 @@ import ai.djl.translate.DeferredTranslatorFactory;
 import ai.djl.translate.TranslateException;
 import io.quarkus.runtime.QuarkusApplication;
 import io.quarkus.runtime.annotations.QuarkusMain;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 @QuarkusMain
 public class AirPassengerPrediction implements QuarkusApplication {
@@ -67,9 +76,71 @@ public class AirPassengerPrediction implements QuarkusApplication {
     @Override
     public int run(String... args) throws Exception {
         AirPassengerPrediction.runExample(args);
+        Path loc = Paths.get( "output/model").toAbsolutePath();
+
+        System.out.println(loc);
+        predict(loc);
         return 0;
     }
 
+    private void predict(Path outputDir)
+        throws MalformedModelException, IOException, TranslateException, ModelNotFoundException {
+
+        try (Model model = Model.newInstance("deepar");NDManager manager = NDManager.newBaseManager("MXNet")) {
+            DeepARNetwork predictionNetwork = getDeepARModel("M", 12, new NegativeBinomialOutput(), false);
+            model.setBlock(predictionNetwork);
+            model.load(outputDir);
+
+            M5ForecastAirPredictionDataset testSet =
+                getDataset(
+                    new ArrayList<>(),
+                    predictionNetwork.getContextLength(),
+                    Dataset.Usage.TEST);
+
+            Map<String, Object> arguments = new ConcurrentHashMap<>();
+            arguments.put("prediction_length", 12);
+            arguments.put("freq", "M");
+            arguments.put("use_" + FieldName.FEAT_DYNAMIC_REAL.name().toLowerCase(), false);
+            arguments.put("use_" + FieldName.FEAT_STATIC_CAT.name().toLowerCase(), false);
+            arguments.put("use_" + FieldName.FEAT_STATIC_REAL.name().toLowerCase(), false);
+
+            DeepARTranslator translator = DeepARTranslator.builder(arguments).build();
+
+            Progress progress = new ProgressBar();
+            progress.reset("Inferring", testSet.size());
+
+            String url = "https://resources.djl.ai/test-models/mxnet/timeseries/air_passengers.json";
+            try (Predictor<TimeSeriesData, Forecast> predictor = model.newPredictor(translator)) {
+                final TimeSeriesData input = getTimeSeriesData(manager, URI.create(url).toURL());
+                NDArray target = input.get(FieldName.TARGET);
+                target.setName("target");
+                Forecast forecast = predictor.predict(input);
+
+                NDArray prediction = forecast.mean();
+
+                System.out.println(Arrays.toString(prediction.toFloatArray()));
+            }
+        }
+
+    }
+
+    private static TimeSeriesData getTimeSeriesData(NDManager manager, URL url) throws IOException {
+        try (Reader reader = new InputStreamReader(url.openStream(), StandardCharsets.UTF_8)) {
+            M5ForecastAirPredictionDataset.AirPassengers passengers =
+                new GsonBuilder()
+                    .setDateFormat("yyyy-MM")
+                    .create()
+                    .fromJson(reader, M5ForecastAirPredictionDataset.AirPassengers.class);
+
+            LocalDateTime start =
+                passengers.start.toInstant().atZone(ZoneId.systemDefault()).toLocalDateTime();
+            NDArray target = manager.create(passengers.target);
+            TimeSeriesData data = new TimeSeriesData(10);
+            data.setStartTime(start);
+            data.setField(FieldName.TARGET, target);
+            return data;
+        }
+    }
 
     public static TrainingResult runExample(String[] arguments) throws IOException, TranslateException {
         
@@ -93,8 +164,21 @@ public class AirPassengerPrediction implements QuarkusApplication {
                 trainer.setMetrics(new Metrics());
 
                 System.out.println("+++++" + trainSet.availableSize());
-                Shape shape = new Shape(1, trainSet.availableSize());
-                trainer.initialize(shape);
+                int historyLength = trainingNetwork.getHistoryLength();
+                Shape[] inputShapes = new Shape[4];
+                // (N, num_cardinality)
+                inputShapes[0] = new Shape(1, 1);
+                // (N, num_real) if use_feat_stat_real else (N, 1)
+                inputShapes[1] = new Shape(1, 1);
+
+                inputShapes[2] =
+                    new Shape(
+                        1,
+                        historyLength,
+                        TimeFeature.timeFeaturesFromFreqStr("M").size() + 1);
+                inputShapes[3] = new Shape(1, historyLength);
+
+                trainer.initialize(inputShapes);
 
                 EasyTrain.fit(trainer, 5, trainSet, null);
                 return trainer.getTrainingResult();
@@ -157,10 +241,5 @@ public class AirPassengerPrediction implements QuarkusApplication {
        
     }
 
-    private static final class AirPassengers {
-
-        Date start;
-        float[] target;
-    }
 
 }
